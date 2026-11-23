@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>코골이 감지기</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8C%99%3C/text%3E%3C/svg%3E" />
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1420; --card: #1a2233; --text: #e8ecf4; --muted: #8a94a8;
+    --accent: #5b8cff; --danger: #ff5b6e; --ok: #4ccf8a; --line: #2a3550; --well: #111828;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 8px 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+  #status { font-size: 20px; font-weight: 600; min-height: 28px; }
+  .muted { color: var(--muted); font-size: 14px; line-height: 1.5; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button {
+    font: inherit; border: 0; border-radius: 10px; padding: 12px 18px; cursor: pointer;
+    background: var(--accent); color: #fff;
+  }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  .meter { height: 14px; background: var(--well); border-radius: 7px; overflow: hidden; margin-top: 12px; }
+  #meterFill { height: 100%; width: 0%; background: var(--ok); transition: width .1s linear; }
+  #meterFill.hot { background: var(--danger); }
+  canvas { width: 100%; height: 160px; display: block; margin-top: 12px; border-radius: 8px; background: var(--well); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+  .stats strong { display: block; font-size: 24px; }
+  .stats span { color: var(--muted); font-size: 12px; }
+  input[type=range] { width: 100%; margin-top: 8px; }
+  ul { list-style: none; padding: 0; margin: 12px 0 0; }
+  li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+  li:last-child { border-bottom: 0; }
+  li.empty { color: var(--muted); justify-content: center; }
+  .bar { width: 80px; height: 8px; background: var(--well); border-radius: 4px; overflow: hidden; flex-shrink: 0; }
+  .bar i { display: block; height: 100%; background: var(--danger); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🌙 코골이 감지기</h1>
+
+  <section class="card">
+    <div id="status">대기 중</div>
+    <p class="muted" id="hint">시작을 누르면 마이크로 주변 소리를 분석합니다. 녹음 파일은 저장하지 않고, 소리는 어디로도 전송되지 않습니다.</p>
+    <div class="row"><button id="toggle">시작</button></div>
+    <div class="meter" title="기준선 대비 현재 소리 크기"><div id="meterFill"></div></div>
+    <canvas id="graph" aria-label="최근 60초 소리 그래프"></canvas>
+    <p class="muted">그래프: 파란선 = 소리 크기, 노란 점선 = 감지 기준선, 빨간 배경 = 코골이로 판단된 구간</p>
+  </section>
+
+  <section class="card">
+    <div class="stats">
+      <div><strong id="todayCount">0</strong><span>오늘 감지 횟수</span></div>
+      <div><strong id="todayMin">0.0</strong><span>오늘 코골이(분)</span></div>
+      <div><strong id="allCount">0</strong><span>전체 누적</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <label for="sens">민감도 <b id="sensLabel"></b></label>
+    <input type="range" id="sens" min="1" max="10" step="1" value="5" />
+    <p class="muted">높을수록 작은 소리도 코골이로 잡습니다. 주변이 시끄러우면 낮추세요.</p>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content: space-between;">
+      <strong>감지 기록</strong>
+      <div class="row">
+        <button class="secondary" id="export">CSV 저장</button>
+        <button class="secondary" id="clear">기록 지우기</button>
+      </div>
+    </div>
+    <ul id="events"></ul>
+  </section>
+
+  <p class="muted">※ 이 앱은 참고용 기록 도구이며 의학적 진단이 아닙니다. 낮에 심하게 졸리거나 자는 중 숨이 멈추는 모습이 자주 보이면 수면 클리닉 진료를 권합니다.</p>
+</main>
+
+<script src="detector.js"></script>
+<script>
+(() => {
+  'use strict';
+
+  const { Detector, frameFeatures } = window.SnoreDetector;
+  const $ = (id) => document.getElementById(id);
+
+  const STORE_KEY = 'snore-events-v1';
+  const TICK_MS = 100;
+  const GRAPH_SEC = 60;
+  const HIST_MAX = (GRAPH_SEC * 1000) / TICK_MS;
+
+  const sensEl = $('sens');
+  const toggleEl = $('toggle');
+  const statusEl = $('status');
+  const hintEl = $('hint');
+  const canvas = $('graph');
+  const g = canvas.getContext('2d');
+
+  let stream = null, ctx = null, analyser = null, buf = null;
+  let timer = null, wakeLock = null, detector = null, t0 = 0;
+  let hist = [];
+
+  // 민감도 1 → 기준 +20dB, 10 → 기준 +8dB
+  const marginFromSens = (s) => 20 - (s - 1) * (12 / 9);
+
+  /* ---------- 저장 (이 기기 브라우저 안에만 보관) ---------- */
+  function loadEvents() {
+    try {
+      const v = JSON.parse(localStorage.getItem(STORE_KEY));
+      return Array.isArray(v) ? v : [];
+    } catch { return []; }
+  }
+  function saveEvents(list) {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(list)); }
+    catch (e) { console.warn('기록 저장 실패', e); }
+  }
+
+  /* ---------- 화면 렌더링 ---------- */
+  function sameLocalDay(iso, d = new Date()) {
+    const x = new Date(iso);
+    return x.getFullYear() === d.getFullYear() && x.getMonth() === d.getMonth() && x.getDate() === d.getDate();
+  }
+
+  function renderStats() {
+    const all = loadEvents();
+    const today = all.filter((e) => sameLocalDay(e.start));
+    const minutes = today.reduce((a, e) => a + e.durationSec, 0) / 60;
+    $('todayCount').textContent = today.length;
+    $('todayMin').textContent = minutes.toFixed(1);
+    $('allCount').textContent = all.length;
+  }
+
+  function renderEvents() {
+    const ul = $('events');
+    ul.replaceChildren();
+    const list = loadEvents().slice(-100).reverse();
+    if (!list.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = '아직 감지된 코골이가 없습니다';
+      ul.append(li);
+      return;
+    }
+    for (const e of list) {
+      const li = document.createElement('li');
+      const label = document.createElement('span');
+      const when = new Date(e.start).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      label.textContent = `${when} · ${e.durationSec.toFixed(1)}초`;
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.title = `기준선 대비 세기 ${e.intensityDb}dB`;
+      const fill = document.createElement('i');
+      fill.style.width = `${Math.min(100, Math.max(5, (e.intensityDb / 30) * 100))}%`;
+      bar.append(fill);
+      li.append(label, bar);
+      ul.append(li);
+    }
+  }
+
+  function drawGraph(floor, threshold) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    const lo = floor - 5, hi = floor + 35;
+    const yOf = (db) => h - ((Math.max(lo, Math.min(hi, db)) - lo) / (hi - lo)) * h;
+    const step = w / HIST_MAX;
+
+    hist.forEach((p, i) => {
+      if (p.cand) { g.fillStyle = 'rgba(255,91,110,0.3)'; g.fillRect(i * step, 0, step + 1, h); }
+    });
+
+    const ty = yOf(threshold);
+    g.strokeStyle = '#ffb020';
+    g.setLineDash([6, 4]);
+    g.beginPath(); g.moveTo(0, ty); g.lineTo(w, ty); g.stroke();
+    g.setLineDash([]);
+
+    g.strokeStyle = '#5b8cff';
+    g.lineWidth = 2;
+    g.beginPath();
+    hist.forEach((p, i) => {
+      const x = i * step, y = yOf(p.db);
+      if (i) g.lineTo(x, y); else g.moveTo(x, y);
+    });
+    g.stroke();
+  }
+
+  function clearGraph() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  /* ---------- 감지 루프 ---------- */
+  function onEvent(ev) {
+    const nowSec = (performance.now() - t0) / 1000;
+    const startWall = Date.now() - (nowSec - ev.startSec) * 1000;
+    const list = loadEvents();
+    list.push({
+      start: new Date(startWall).toISOString(),
+      durationSec: ev.durationSec,
+      intensityDb: Math.round(ev.intensityDb * 10) / 10,
+    });
+    saveEvents(list);
+    renderEvents();
+    renderStats();
+  }
+
+  function tick() {
+    analyser.getFloatFrequencyData(buf);
+    const feat = frameFeatures(buf, ctx.sampleRate, analyser.fftSize);
+    const r = detector.process(feat, (performance.now() - t0) / 1000);
+    if (r.closed) onEvent(r.closed);
+
+    hist.push({ db: feat.levelDb, cand: r.isCandidate });
+    if (hist.length > HIST_MAX) hist.shift();
+
+    const rel = (feat.levelDb - r.floorDb + 5) / 40;
+    $('meterFill').style.width = `${Math.round(Math.max(0, Math.min(1, rel)) * 100)}%`;
+    $('meterFill').classList.toggle('hot', r.isCandidate);
+    statusEl.textContent = r.isCandidate ? '🔴 코골이로 보이는 소리 감지 중' : '🟢 듣는 중';
+    drawGraph(r.floorDb, r.thresholdDb);
+  }
+
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch { /* 지원하지 않거나 거부됨: 화면 꺼짐 설정을 직접 끄세요 */ }
+  }
+
+  /* ---------- 시작 / 정지 ---------- */
+  async function start() {
+    toggleEl.disabled = true;
+    try {
+      // 노이즈 억제/자동 이득을 끄야 코골이 소리가 깎이지 않음
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
+    } catch (e) {
+      statusEl.textContent = '마이크를 사용할 수 없습니다';
+      hintEl.textContent = `브라우저에서 마이크 권한을 허용한 뒤 다시 시도해 주세요. (${e.name})`;
+      toggleEl.disabled = false;
+      return;
+    }
+
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 4096;            // 약 11.7Hz 간격: 저주파 구분에 충분
+    analyser.smoothingTimeConstant = 0;
+    ctx.createMediaStreamSource(stream).connect(analyser); // destination에 연결하지 않아 소리가 되돌아 나오지 않음
+    buf = new Float32Array(analyser.frequencyBinCount);
+
+    detector = new Detector({ marginDb: marginFromSens(+sensEl.value) });
+    hist = [];
+    t0 = performance.now();
+    timer = setInterval(tick, TICK_MS);
+    keepAwake();
+
+    toggleEl.textContent = '정지';
+    toggleEl.classList.add('danger');
+    toggleEl.disabled = false;
+    hintEl.textContent = '휴대폰/노트북을 머리맡 0.5~1m에 두고, 이 탭을 열어 둔 상태를 유지하세요. 충전기를 연결하면 좋습니다.';
+  }
+
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+    const ev = detector.flush();
+    if (ev) onEvent(ev);
+    stream.getTracks().forEach((t) => t.stop());
+    ctx.close();
+    analyser = null;
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+
+    toggleEl.textContent = '시작';
+    toggleEl.classList.remove('danger');
+    statusEl.textContent = '대기 중';
+    $('meterFill').style.width = '0%';
+    hist = [];
+    clearGraph();
+    hintEl.textContent = '시작을 누르면 마이크로 주변 소리를 분석합니다. 녹음 파일은 저장하지 않고, 소리는 어디로도 전송되지 않습니다.';
+  }
+
+  toggleEl.addEventListener('click', () => (timer ? stop() : start()));
+
+  document.addEventListener('visibilitychange', () => {
+    if (timer && document.visibilityState === 'visible') keepAwake();
+  });
+
+  /* ---------- 민감도 ---------- */
+  function updateSensLabel() {
+    const m = marginFromSens(+sensEl.value);
+    $('sensLabel').textContent = `${sensEl.value} (기준 +${m.toFixed(0)}dB)`;
+    if (detector) detector.setMarginDb(m);
+  }
+  sensEl.addEventListener('input', updateSensLabel);
+
+  /* ---------- 기록 내보내기 / 삭제 ---------- */
+  $('export').addEventListener('click', () => {
+    const rows = [['start_iso', 'duration_sec', 'intensity_db']];
+    for (const e of loadEvents()) rows.push([e.start, e.durationSec, e.intensityDb]);
+    const csv = '﻿' + rows.map((r) => r.join(',')).join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = Object.assign(document.createElement('a'), {
+      href: url,
+      download: `snore-${new Date().toISOString().slice(0, 10)}.csv`,
+    });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  $('clear').addEventListener('click', () => {
+    if (!confirm('모든 감지 기록을 삭제할까요?')) return;
+    try { localStorage.removeItem(STORE_KEY); } catch { /* 무시 */ }
+    renderEvents();
+    renderStats();
+  });
+
+  /* ---------- 초기화 ---------- */
+  updateSensLabel();
+  renderEvents();
+  renderStats();
+  clearGraph();
+})();
+</script>
+</body>
+</html>

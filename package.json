@@ -1,0 +1,11 @@
+{
+  "name": "my-home-snore-detector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "브라우저에서 동작하는 무료 코골이 감지기",
+  "scripts": {
+    "test": "node --test test/detector.test.js",
+    "start": "python3 -m http.server 8000"
+  },
+  "license": "MIT"
+}
